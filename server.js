@@ -18,7 +18,7 @@ const GAMES = path.join(DATA, 'games');
 const ASSETS = path.join(DATA, 'assets');
 const ROOMS_FILE = path.join(DATA, 'rooms.json');
 const GRACE = +process.env.GRACE_MS || 300000;          // 5 phút để kết nối lại
-const RESET_MIN = +process.env.RESET_MIN_MS || 8000;    // sau 8s mới hiện nút reset
+const RESET_MIN = +process.env.RESET_MIN_MS || 5000;    // sau 5s mới hiện nút reset
 const RESET_AUTO = +process.env.RESET_AUTO_MS || 15000; // 15s tự reset
 const TS = +process.env.TIME_SCALE || 1; // chỉ dùng khi kiểm thử
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -117,10 +117,11 @@ class Room {
   constructor(code, size, total, turnMs, host) {
     this.code = code; this.size = size; this.total = total; this.turnMs = turnMs; this.host = host;
     this.players = []; this.spec = new Map(); this.chat = []; this.touched = Date.now();
-    this.clockTimer = null; this.autoTimer = null; this.newGame();
+    this.clockTimer = null; this.autoTimer = null; this.undoTimer = null; this.newGame();
   }
   newGame() {
-    clearTimeout(this.clockTimer); clearTimeout(this.autoTimer);
+    clearTimeout(this.clockTimer); clearTimeout(this.autoTimer); clearTimeout(this.undoTimer);
+    this.spent = []; this.undoLeft = [3, 3]; this.undoReq = null;
     this.board = new Uint8Array(this.size * this.size);
     this.moves = []; this.turn = 0; this.result = null;
     this.bank = [this.total, this.total]; this.turnStart = 0; this.endedAt = 0;
@@ -142,7 +143,8 @@ class Room {
       status: this.status, turn: this.turn, moves: this.moves, result: this.result, gameId: this.gameId,
       you: this.pidx(pid), host: this.host === pid, bank: this.bank, running,
       ago: running ? now - this.turnStart : 0, endedAgo: this.endedAt ? now - this.endedAt : 0,
-      resetMin: RESET_MIN, resetAuto: RESET_AUTO,
+      resetMin: RESET_MIN, resetAuto: RESET_AUTO, undoLeft: this.undoLeft,
+      undo: this.undoReq ? { by: this.undoReq.by } : null,
       players: this.players.map((p) => ({
         name: p.name, u: p.u, style: p.style, online: !!p.conn && !p.gone, gone: !!p.gone,
         left: p.discAt ? Math.max(0, p.discAt + GRACE - now) : 0,
@@ -175,6 +177,7 @@ class Room {
     this.status = 'finished';
     this.result = { winner, reason, line: line || null };
     this.clearTimers();
+    if (this.undoReq) this.endUndo(false, 'ended');
     this.endedAt = Date.now();
     clearTimeout(this.autoTimer);
     this.autoTimer = setTimeout(() => this.autoReset(), RESET_AUTO);
@@ -196,11 +199,14 @@ class Room {
     if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x >= this.size || y >= this.size) return 'Ô không hợp lệ';
     if (this.board[y * this.size + x]) return 'Ô đã có quân';
     const now = Date.now();
+    if (this.undoReq) this.endUndo(false, 'moved');
+    let spent = 0;
     if (this.moves.length > 0) { // nước đầu tiên chưa tính giờ
       const el = now - this.turnStart;
       if (el > Math.min(this.turnMs, this.bank[i]) + 250) { this.timeout(i); return null; }
-      this.bank[i] = Math.max(0, this.bank[i] - el);
+      spent = Math.min(el, this.bank[i]); this.bank[i] = Math.max(0, this.bank[i] - el);
     }
+    this.spent.push(spent);
     this.board[y * this.size + x] = i + 1;
     this.moves.push([x, y]);
     const line = checkWin(this.board, this.size, x, y, i + 1);
@@ -211,6 +217,31 @@ class Room {
     else if (draw) this.finish(null, 'draw');
     else persist();
     return null;
+  }
+  requestUndo(pid) {
+    const i = this.pidx(pid);
+    if (this.status !== 'playing' || i < 0) return 'Không thể lùi lúc này';
+    if (!this.moves.length || (this.moves.length - 1) % 2 !== i) return 'Chỉ xin lùi được nước bạn vừa đi (khi đối thủ chưa đánh)';
+    if (this.undoLeft[i] <= 0) return 'Bạn đã hết lượt xin lùi trong ván này';
+    if (this.undoReq) return 'Đang chờ đối thủ trả lời';
+    if (!this.players[1 - i].conn) return 'Đối thủ đang mất kết nối';
+    this.undoReq = { by: i, at: Date.now() };
+    clearTimeout(this.undoTimer);
+    this.undoTimer = setTimeout(() => this.endUndo(false, 'timeout'), 15000);
+    this.bc({ t: 'undoreq', by: i });
+    return null;
+  }
+  endUndo(ok, reason) {
+    if (!this.undoReq) return;
+    const by = this.undoReq.by; this.undoReq = null; clearTimeout(this.undoTimer);
+    if (!ok) return this.bc({ t: 'undoend', reason });
+    const mv = this.moves.pop();
+    this.board[mv[1] * this.size + mv[0]] = 0;
+    this.bank[by] += this.spent.pop() || 0;
+    this.turn = by; this.turnStart = Date.now(); this.undoLeft[by]--;
+    this.armClock();
+    this.bc({ t: 'undone', n: this.moves.length, turn: this.turn, bank: this.bank, by, left: this.undoLeft });
+    persist();
   }
   forfeit(i) {
     if (this.status !== 'playing') return;
@@ -290,6 +321,7 @@ try {
     const r = new Room(d.code, d.size, d.total || 300000, d.turnMs || 60000, d.host);
     Object.assign(r, { status: d.status, turn: d.turn, moves: d.moves, result: d.result, gameId: d.gameId, startedAt: d.startedAt, chat: d.chat, bank: d.bank || [r.total, r.total] });
     d.moves.forEach(([x, y], i) => { r.board[y * d.size + x] = (i % 2) + 1; });
+    r.spent = d.moves.map(() => 0);
     for (const p of d.players) {
       r.players.push({ pid: p.pid, u: ushort(p.pid), name: p.name, style: p.style, conn: null, discAt: 0, timer: null, gone: !!p.gone });
       pidRoom.set(p.pid, r.code);
@@ -504,6 +536,16 @@ function handle(c, m) {
       const i = r.pidx(pid);
       if (i >= 0 && r.status === 'playing') r.finish(1 - i, 'resign');
       break;
+    }
+    case 'undo': {
+      const r = room(); if (!r) return;
+      const e = r.requestUndo(pid);
+      if (e) c.send({ t: 'err', c: 'undo', m: e });
+      break;
+    }
+    case 'undoreply': {
+      const r = room(); if (!r || !r.undoReq || r.pidx(pid) !== 1 - r.undoReq.by) return;
+      r.endUndo(!!m.ok, 'declined'); break;
     }
     case 'reset': {
       const r = room(); if (!r || r.pidx(pid) < 0 || !r.canReset()) return;
